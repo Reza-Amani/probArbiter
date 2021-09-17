@@ -10,12 +10,10 @@
             "type": "go",
             "request": "launch",
             "mode": "debug",
-            "program": "C:/Users/Reza.Amani/Documents/Private/HttpProbit",
+            "program": "C:/Users/Reza.Amani/Documents/Private/probArbiter",
             "env": {},
-            //"args": ["compete", "--buy", "4", "--sell", "6", "--pair", "MCO2-USDT", "--quantity", "1"],
-//            "args": ["multiCompete","-f", "sells.json", "--protocol","http"],
-            "args": ["autoCompete","-t", "12","-q", "5","-M", "10"],
-//"args": ["profiler"],
+            "args": ["arbiter","10"],
+
 }
 
     ]

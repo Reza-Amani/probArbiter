@@ -17,6 +17,7 @@ import (
 
 type marketPairer interface {
 	SetIncrement(i decimal.Decimal)
+	UpdateMarketData(d MarketData)
 }
 type Comms struct {
 	socket      gowebsocket.Socket
@@ -601,5 +602,196 @@ func (o *Comms) GetMarketOrdersHttp(p string) (*marketOrders, error) {
 	//605(5.34.04pm)562(5.34.48pm)
 	//resp.Satus "429 Too Many Requests"
 	return &h, nil
+
+}
+
+/////////////////////////////////////Socket functions
+func (o *Comms) UnregisterPair(p string) {
+	o.UnSubscribe(p)
+	if _, found := o.marketPairs[p]; found {
+		delete(o.marketPairs, p)
+	}
+}
+func (o *Comms) Connect() {
+	o.socket = gowebsocket.New("wss://api.probit.com/api/exchange/v1/ws")
+
+	o.socket.OnConnected = func(socket gowebsocket.Socket) {
+		o.warnLog.Println("Connected to server")
+	}
+
+	o.socket.OnConnectError = func(err error, socket gowebsocket.Socket) {
+		o.errLog.Println("Recieved connect error ", err)
+	}
+
+	o.socket.OnTextMessage = o.handleRXMessage
+
+	o.socket.OnBinaryMessage = func(data []byte, socket gowebsocket.Socket) {
+		o.infoLog.Println("Recieved binary data ", data)
+	}
+
+	o.socket.OnPingReceived = func(data string, socket gowebsocket.Socket) {
+	}
+
+	o.socket.OnPongReceived = func(data string, socket gowebsocket.Socket) {
+		o.infoLog.Println("Recieved pong " + data)
+	}
+
+	o.socket.OnDisconnected = func(err error, socket gowebsocket.Socket) {
+		o.errLog.Println("Disconnected from server ")
+		if o.toBeClosed {
+			o.warnLog.Println("intentional closing")
+			return
+		}
+		o.socket.Connect()
+		o.warnLog.Println("ReSubscribing pairs:", len(o.marketPairs))
+		for p, _ := range o.marketPairs {
+			time.Sleep(time.Millisecond * 10)
+			o.Subscribe(p)
+		}
+		return
+	}
+	o.socket.Connect()
+	o.warnLog.Println("Subscribing pairs:", len(o.marketPairs))
+	for p, _ := range o.marketPairs {
+		time.Sleep(time.Millisecond * 10)
+		o.Subscribe(p)
+	}
+}
+func (o *Comms) RegisterPair(p string, m marketPairer) error {
+	s, err := o.GetMarketSpec(p)
+	if err != nil {
+		o.errLog.Println("ERROR: pair registration failed:", err)
+		return err
+	}
+	i, e := decimal.NewFromString(s.PriceIncrement)
+	if e != nil {
+		o.errLog.Println("ERROR: parsing increment:", e)
+		return err
+	}
+	o.marketPairs[p] = m
+	m.SetIncrement(i)
+	//	o.Subscribe(p)
+	return nil
+}
+func (o *Comms) Subscribe(pair string) {
+
+	command := `{ 
+			"type": "subscribe",
+	"channel": "marketdata",
+	"interval": 100,
+	"market_id": "`
+	command = command + pair
+	command = command + `",
+	"filter": ["order_books"]
+	}`
+	o.socket.SendText(command)
+}
+func (o *Comms) UnSubscribe(pair string) {
+
+	command := `{ 
+			"type": "subscribe",
+	"channel": "marketdata",
+	"interval": 100,
+	"market_id": "`
+	command = command + pair
+	command = command + `",
+	"filter": ["ticker"]
+	}`
+	o.socket.SendText(command)
+}
+func (o *Comms) receiveMarketData(message string) {
+	//o.marketpair.callback(MarketData)
+
+	var d MarketData
+	d.Reset = false
+	o.infoLog.Println("Recieved MarketData: " + message)
+	err := json.Unmarshal([]byte(message), &d)
+	if err != nil {
+		o.errLog.Println("error unmarshaling market data: ", err)
+		return
+	}
+	m, found := o.marketPairs[d.MarketID]
+	if !found {
+		o.errLog.Println("market data received for a non-interested pair")
+		return
+	}
+	m.UpdateMarketData(d)
+}
+
+func (o *Comms) handleRXMessage(message string, socket gowebsocket.Socket) {
+	//	if message != "{\"type\":\"authorization\",\"result\":\"ok\"}" {
+	if strings.Contains(message, `"channel":"marketdata"`) {
+		//o.updateMarketData(message, socket)
+		o.receiveMarketData(message)
+		return
+	}
+	if strings.Contains(message, `"type":"authorization","result":"ok"`) {
+		o.infoLog.Println("authorised: ", message)
+		return
+	}
+	if strings.Contains(message, `"errorCode":"UNAUTHORIZED"`) {
+		o.errLog.Println("UNauthorised: ", message)
+		return
+	}
+	//{"type":"error","message":"ping timeout"}
+	if strings.Contains(message, `"ping timeout"`) {
+		o.errLog.Println("unhandled ERROR ping timeout: ", message)
+		return
+	}
+	o.errLog.Println("unhandled packet")
+	l := len(message)
+	if l > 200 {
+		l = 200
+	}
+	o.errLog.Println(message[:l])
+}
+func (o *Comms) GetMarketOrders(p string) (*marketOrders, error) {
+	req, e := http.NewRequest("GET", "https://api.probit.com/api/exchange/v1/order_book", nil)
+	if e != nil {
+		o.errLog.Println("Error in get market orders:", e)
+		return nil, e
+	}
+	q := req.URL.Query()
+	q.Add("market_id", p)
+	req.URL.RawQuery = q.Encode()
+	// req.Header.Add("Accept", "application/json")
+	// req.Header.Add("Authorization", "Bearer "+o.Token.AccessToken)
+	o.infoLog.Println(req.URL.String())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		o.errLog.Println("Error in market orders resp:", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	b, e := ioutil.ReadAll(resp.Body)
+	o.infoLog.Println(string(b))
+	if e != nil {
+		o.errLog.Println("io err:", e)
+		return nil, e
+	}
+	h := marketOrders{}
+	err = json.Unmarshal(b, &h)
+	if err != nil {
+		o.errLog.Println("error in reading market orders:", err)
+		o.errLog.Println(resp.Status)
+		if strings.Contains(resp.Status, "Too Many") {
+			o.RateLimitTimeout = time.Now().Add(time.Second * 120)
+			o.errLog.Println("Rate Timeout:", o.RateLimitTimeout, time.Now())
+		}
+		return nil, err
+	}
+
+	return &h, nil
+
+}
+func (o *Comms) CloseSocket() {
+	o.toBeClosed = true
+	o.socket.Close()
+}
+func (o *Comms) OpenSocket() {
+	o.toBeClosed = false
+	o.Connect()
+	o.AuthSocket()
 
 }

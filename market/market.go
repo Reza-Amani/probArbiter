@@ -31,7 +31,7 @@ type MarketPair struct {
 	MyLowestSell     order
 	increment        decimal.Decimal
 
-	callbackHttp func(m *MarketPair)
+	callBack func(m *MarketPair)
 
 	infoLog *log.Logger
 	warnLog *log.Logger
@@ -42,7 +42,7 @@ func NewMarketPair(p string, c *Comms, s pairSpec, callbackhttp func(m *MarketPa
 	m := MarketPair{}
 	m.pair = p
 	m.comms = c
-	m.callbackHttp = callbackhttp
+	m.callBack = callbackhttp
 	split := strings.Split(m.pair, "-")
 	m.Coin = split[0]
 	m.Quote = split[1]
@@ -172,6 +172,78 @@ func (o *MarketPair) groomOrdersHttp(or *marketOrders) {
 		}
 	}
 }
+func (o *MarketPair) UpdateMarketData(d MarketData) {
+	if d.Reset == true { //a complete packet, not only diff
+		//json.Unmarshal([]byte(message), &o.data)
+		o.data = d
+		o.warnLog.Println(o.pair, " The first marketData packet stored")
+	} else { //a short diff packet
+		for _, newOrder := range d.OrderBooks {
+			found := false
+			for i, oldOrder := range o.data.OrderBooks {
+				if newOrder.Price == oldOrder.Price && newOrder.Side == oldOrder.Side {
+					if found {
+						o.infoLog.Println(o.pair, "A duplicate?")
+					}
+					o.infoLog.Println(o.pair, "new order applied")
+					//oldOrder.Quantity = newOrder.Quantity
+					o.data.OrderBooks[i].Quantity = newOrder.Quantity
+					found = true
+				}
+			}
+			if !found {
+				o.data.OrderBooks = append(o.data.OrderBooks, newOrder)
+				o.infoLog.Println(o.pair, "new order appended")
+			}
+		}
+		o.infoLog.Println(o.pair, "A diff packet stored")
+	}
+
+	o.groomOrders()
+	o.infoLog.Println(o.pair, "Market:", o.MarketLowestSell.Price, "(", o.MarketLowestSell.Quantity, ")-", o.MarketHighestBuy.Price, "(", o.MarketHighestBuy.Quantity, ")")
+	o.callBack(o)
+}
+func (o *MarketPair) groomOrders() {
+	if o.MarketLowestSell.Price.IsZero() {
+		o.MarketLowestSell.Price = decimal.NewFromInt(9999999) //TODO: o.spec.MaxPrice
+	}
+	//remove orders with quantity==0
+	o.infoLog.Println(o.pair, " no of order:", len(o.data.OrderBooks))
+	i := 0
+	l := len(o.data.OrderBooks)
+	for i < l {
+		if o.data.OrderBooks[i].Quantity == "0" {
+			o.data.OrderBooks = append(o.data.OrderBooks[:i], o.data.OrderBooks[i+1:]...)
+			l--
+		} else {
+			i++
+		}
+	}
+	o.data.OrderBooks = o.data.OrderBooks[:i]
+	o.infoLog.Println(o.pair, " no of order After:", len(o.data.OrderBooks))
+
+	//find HighestBuy and LowestSell
+	o.MarketHighestBuy.Price = decimal.NewFromInt(0)
+	o.MarketHighestBuy.Quantity = decimal.NewFromInt(0)
+	o.MarketLowestSell.Price = decimal.NewFromInt(999999)
+	o.MarketLowestSell.Quantity = decimal.NewFromInt(0)
+	for _, r := range o.data.OrderBooks {
+		p, _ := decimal.NewFromString(r.Price)
+		q, _ := decimal.NewFromString(r.Quantity)
+		b := (r.Side == "buy")
+		if b {
+			if p.GreaterThanOrEqual(o.MarketHighestBuy.Price) && q.IsPositive() {
+				o.MarketHighestBuy.Price = p
+				o.MarketHighestBuy.Quantity = q
+			}
+		} else {
+			if p.LessThanOrEqual(o.MarketLowestSell.Price) && q.IsPositive() {
+				o.MarketLowestSell.Price = p
+				o.MarketLowestSell.Quantity = q
+			}
+		}
+	}
+}
 func (o *MarketPair) UpdateMarketHttp() error {
 	r, er := o.comms.GetMarketOrdersHttp(o.pair)
 	if er != nil {
@@ -184,7 +256,7 @@ func (o *MarketPair) UpdateMarketHttp() error {
 		o.errLog.Println(er)
 		return er
 	}
-	o.callbackHttp(o)
+	o.callBack(o)
 	return nil
 }
 
